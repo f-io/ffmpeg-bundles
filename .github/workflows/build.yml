@@ -1,7 +1,10 @@
-name: ffplay bundles
+name: build ffmpeg toolchain
 
 on:
   workflow_dispatch:
+
+env:
+  FFMPEG_REF: n8.0.1
 
 jobs:
   win_x64:
@@ -22,12 +25,12 @@ jobs:
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-nasm
 
-      - name: Build ffplay
+      - name: Build ffplay + ffmpeg (shared)
         shell: msys2 {0}
         run: |
           set -euo pipefail
           rm -rf FFmpeg
-          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
+          git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git
           cd FFmpeg
 
           ./configure \
@@ -35,35 +38,72 @@ jobs:
             --target-os=mingw32 \
             --arch=x86_64 \
             --enable-ffplay \
-            --disable-ffmpeg \
+            --enable-ffmpeg \
             --disable-ffprobe \
             --disable-doc \
             --disable-debug \
-            --enable-sdl2
+            --enable-sdl2 \
+            --enable-avdevice \
+            --enable-shared \
+            --disable-static
 
-          make -j"$(nproc)"
+          make -j"$(nproc 2>/dev/null || echo 2)"
           make install
+          
+          echo "== devices =="
+          ./out/bin/ffmpeg.exe -hide_banner -devices 2>&1 | sed -n '1,220p' || true
 
-      - name: Package
+          echo "== ffplay smoke test =="
+          perl -e 'alarm 10; exec @ARGV' ./out/bin/ffplay.exe \
+            -hide_banner -autoexit -nodisp \
+            -f lavfi -i anullsrc=r=48000:cl=stereo \
+            -t 0.2 \
+            >ffplay.log 2>&1 || true
+          sed -n '1,140p' ffplay.log || true
+
+      - name: Package (bundle all needed DLLs automatically)
         shell: msys2 {0}
         run: |
           set -euo pipefail
           cd FFmpeg
           mkdir -p bundle/win-x64/bin
-          cp -v out/bin/ffplay.exe bundle/win-x64/bin/
 
-          MINGW_BIN="/mingw64/bin"
-          for f in SDL2.dll libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
-            cp -v "$MINGW_BIN/$f" bundle/win-x64/bin/
+          # binaries
+          cp -v out/bin/ffplay.exe bundle/win-x64/bin/
+          cp -v out/bin/ffmpeg.exe bundle/win-x64/bin/
+
+          # ffmpeg shared libs
+          cp -v out/bin/*.dll bundle/win-x64/bin/
+          cp -vn /mingw64/bin/SDL2.dll bundle/win-x64/bin/ || true
+
+          # helper: collect /mingw64/bin dll deps for an exe via ldd
+          collect_deps () {
+            local exe="$1"
+            ldd "$exe" \
+              | awk '{
+                  for (i=1;i<=NF;i++) if ($i ~ /^\/mingw64\/bin\/.*\.dll$/) print $i
+                }' \
+              | sort -u
+          }
+
+          deps="$(collect_deps bundle/win-x64/bin/ffplay.exe; collect_deps bundle/win-x64/bin/ffmpeg.exe)"
+          for d in $deps; do
+            cp -vn "$d" bundle/win-x64/bin/ || true
           done
 
+          # final check: no missing dlls
+          echo "== ldd check ffplay =="
+          ldd bundle/win-x64/bin/ffplay.exe | sed -n '1,200p' || true
+          echo "== ldd check ffmpeg =="
+          ldd bundle/win-x64/bin/ffmpeg.exe | sed -n '1,200p' || true
+
           cd bundle
-          powershell.exe -NoProfile -Command "Compress-Archive -Path win-x64 -DestinationPath ..\\ffplay-win-x64.zip -Force"
+          powershell.exe -NoProfile -Command "Compress-Archive -Path win-x64 -DestinationPath ..\\fftools-win-x64.zip -Force"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ffplay-win-x64
-          path: FFmpeg/ffplay-win-x64.zip
+          name: fftools-win-x64
+          path: FFmpeg/fftools-win-x64.zip
 
   macos_arm64:
     runs-on: macos-latest
@@ -77,25 +117,37 @@ jobs:
           brew update >/dev/null
           brew install sdl2 nasm pkg-config
 
-      - name: Build ffplay
+      - name: Build ffplay + ffmpeg (pinned)
         shell: bash
         run: |
           set -euo pipefail
           rm -rf FFmpeg
-          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
+          git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git
           cd FFmpeg
 
           ./configure \
             --prefix="$PWD/out" \
             --enable-ffplay \
-            --disable-ffmpeg \
+            --enable-ffmpeg \
             --disable-ffprobe \
             --disable-doc \
             --disable-debug \
-            --enable-sdl2
+            --enable-sdl2 \
+            --enable-avdevice
 
           make -j"$(sysctl -n hw.ncpu)"
           make install
+
+          echo "== devices =="
+          ./out/bin/ffmpeg -hide_banner -devices 2>&1 | sed -n '1,200p' || true
+
+          echo "== ffplay audio-out smoke test =="
+          perl -e 'alarm 10; exec @ARGV' ./out/bin/ffplay \
+            -hide_banner -autoexit -nodisp \
+            -f lavfi -i anullsrc=r=48000:cl=stereo \
+            -t 0.2 \
+            >ffplay.log 2>&1 || true
+          sed -n '1,120p' ffplay.log || true
 
       - name: Package
         shell: bash
@@ -103,11 +155,14 @@ jobs:
           set -euo pipefail
           cd FFmpeg
           mkdir -p bundle/macos-arm64/bin
+
           cp -v out/bin/ffplay bundle/macos-arm64/bin/
+          cp -v out/bin/ffmpeg bundle/macos-arm64/bin/
+
           cd bundle
-          zip -r ../ffplay-macos-arm64.zip macos-arm64
+          zip -r ../fftools-macos-arm64.zip macos-arm64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ffplay-macos-arm64
-          path: FFmpeg/ffplay-macos-arm64.zip
+          name: fftools-macos-arm64
+          path: FFmpeg/fftools-macos-arm64.zip
