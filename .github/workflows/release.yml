@@ -1,0 +1,86 @@
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Resolve last successful "build" run id
+        id: run
+        run: |
+          set -euo pipefail
+
+          WF_FILE="build.yml"
+
+          RUN_ID="$(gh run list \
+            --workflow "$WF_FILE" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            -q '.[0].databaseId')"
+
+          if [ -z "${RUN_ID:-}" ] || [ "${RUN_ID:-}" = "null" ]; then
+            echo "No successful runs found for $WF_FILE"
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using run id: $RUN_ID"
+
+      - name: Download artifacts from that run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.run.outputs.run_id }}
+          path: artifacts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List artifacts
+        run: |
+          set -euo pipefail
+          find artifacts -type f -maxdepth 5 -print
+
+      - name: Create or update release (latest)
+        run: |
+          set -euo pipefail
+
+          TAG="latest"
+          TITLE="latest"
+          NOTES="Manual publish from build run ${{ steps.run.outputs.run_id }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "$TITLE" --notes "$NOTES"
+          fi
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          TAG="latest"
+
+          # only files (no directories)
+          mapfile -d '' files < <(find artifacts -type f -print0)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifact files found under artifacts/"
+            exit 1
+          fi
+
+          echo "Uploading files:"
+          printf ' - %s\n' "${files[@]}"
+
+          gh release upload "$TAG" "${files[@]}" --clobber
